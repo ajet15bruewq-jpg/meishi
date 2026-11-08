@@ -69,3 +69,12 @@ details pre{white-space:pre-wrap;font-size:12px;background:var(--fill);padding:8
 .modal h3{margin:0 0 8px}
 .modal p{white-space:pre-line;margin:0 0 14px}
 .modal .big{margin-bottom:8px}
+input[type=checkbox]{-webkit-appearance:checkbox;appearance:auto;width:24px;height:24px;flex:none;accent-color:var(--accent);padding:0}
+.fsel{background:var(--card);border-radius:12px;overflow:hidden}
+.fchk{display:flex!important;align-items:center;gap:12px;padding:12px 14px;border-bottom:.5px solid var(--line);cursor:pointer;font-size:16px!important;color:var(--text)!important;margin:0!important}
+.fchk:last-child{border-bottom:0}
+.fchk .nm{flex:1}
+.fchk .st{font-size:13px;color:var(--sub)}
+.fchk .st::after{content:"入れない"}
+.fchk:has(input:checked) .st{color:var(--accent);font-weight:600}
+.fchk:has(input:checked) .st::after{content:"✓ 入っている"}
