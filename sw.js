@@ -1,4 +1,4 @@
-const VER = 'meishi-v1';
+const VER = 'meishi-v2';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png', 'lib/tesseract.min.js', 'lib/worker.min.js'];
 // OCR用の大きいファイル。取得に失敗してもインストールは止めない
 const OCR = ['lib/lang/jpn.traineddata.gz', 'lib/lang/eng.traineddata.gz', 'lib/tesseract-core-simd-lstm.wasm.js', 'lib/tesseract-core-lstm.wasm.js'];
@@ -6,7 +6,8 @@ const OCR = ['lib/lang/jpn.traineddata.gz', 'lib/lang/eng.traineddata.gz', 'lib/
 self.addEventListener('install', e => {
   e.waitUntil((async () => {
     const c = await caches.open(VER);
-    await c.addAll(SHELL);
+    // cache:'reload' でブラウザの古いキャッシュを使わず、必ず最新を取得する
+    await Promise.all(SHELL.map(u => c.add(new Request(u, { cache: 'reload' }))));
     await Promise.allSettled(OCR.map(u => c.add(u)));
     await self.skipWaiting();
   })());

@@ -1,4 +1,5 @@
 'use strict';
+const APP_VERSION = '4';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -216,7 +217,7 @@ async function viewList() {
     L.sort(ui.sort === 'met'
       ? (a, b) => (lastMet(b) ? 1 : 0) - (lastMet(a) ? 1 : 0) || cmp(lastMet(b), lastMet(a)) || cmp(sortKey(a), sortKey(b))
       : (a, b) => cmp(by[ui.sort](a), by[ui.sort](b)) || cmp(sortKey(a), sortKey(b)));
-    $('#cnt').textContent = `${L.length}件`;
+    $('#cnt').textContent = `${L.length}件  (版 ${APP_VERSION})`;
     $('#listBox').innerHTML = L.length ? `<div class="list">${L.map(c => {
       let img = '';
       if (ui.mode === 'image') {
