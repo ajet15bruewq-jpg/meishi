@@ -28,7 +28,8 @@ const DB = (() => {
     async saveCard(card, img, thumb) {
       const t = (await open()).transaction(['cards', 'images', 'thumbs'], 'readwrite');
       t.objectStore('cards').put(card);
-      if (img) { t.objectStore('images').put({ id: card.id, blob: img }); t.objectStore('thumbs').put({ id: card.id, blob: thumb }); }
+      // iPhoneでBlobの保存が不安定なため、バイト列として保存する
+      if (img) { t.objectStore('images').put({ id: card.id, buf: img.buf, type: img.type }); t.objectStore('thumbs').put({ id: card.id, buf: thumb.buf, type: thumb.type }); }
       return done(t);
     },
     async delCard(id) {
@@ -59,6 +60,18 @@ function toCanvas(img, max) {
   const c = document.createElement('canvas'); c.width = Math.round(w * s); c.height = Math.round(h * s);
   c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return c;
 }
+const blobOf = r => r.blob || new Blob([r.buf], { type: r.type || 'image/jpeg' });
+// OCR用: グレースケール化+コントラスト補正(明暗の幅を広げる)
+function enhance(c) {
+  const g = c.getContext('2d'), d = g.getImageData(0, 0, c.width, c.height), p = d.data, h = new Uint32Array(256);
+  for (let i = 0; i < p.length; i += 4) { const y = (p[i] * 299 + p[i + 1] * 587 + p[i + 2] * 114) / 1000 | 0; p[i] = y; h[y]++; }
+  const n = p.length / 4; let lo = 0, hi = 255, s = 0;
+  for (; lo < 255 && (s += h[lo]) < n * .01; lo++);
+  for (s = 0; hi > 0 && (s += h[hi]) < n * .01; hi--);
+  const k = 255 / Math.max(1, hi - lo);
+  for (let i = 0; i < p.length; i += 4) { const v = Math.max(0, Math.min(255, (p[i] - lo) * k)); p[i] = p[i + 1] = p[i + 2] = v; }
+  g.putImageData(d, 0, 0); return c;
+}
 const toBlob = (c, q) => new Promise(r => c.toBlob(r, 'image/jpeg', q));
 
 /* ========== OCR(端末内 Tesseract.js) ========== */
@@ -75,7 +88,8 @@ async function getWorker() {
 async function runOCR(canvas, cb) {
   progressCb = cb;
   const w = await getWorker();
-  const { data } = await w.recognize(canvas);
+  await w.setParameters({ tessedit_pageseg_mode: '11' }); // 名刺は文字が点在するため疎なテキスト向けモード
+  const { data } = await w.recognize(enhance(canvas));
   return data.text || '';
 }
 
@@ -177,7 +191,7 @@ async function viewList() {
     <div class="count" id="cnt"></div><div id="listBox"></div>
     <button class="fab" id="add">＋ 撮影</button>`;
   const cards = await DB.all('cards');
-  const thumbs = new Map((await DB.all('thumbs')).map(t => [t.id, t.blob]));
+  const thumbs = new Map((await DB.all('thumbs')).map(t => [t.id, blobOf(t)]));
   const draw = () => {
     revokeUrls();
     document.querySelectorAll('#sortSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === ui.sort));
@@ -281,7 +295,10 @@ async function viewForm(id, opt = {}) {
     if (!d.last && !d.first && !d.company) { toast('名前か会社名を入力してください'); return; }
     const now = Date.now();
     const saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, updatedAt: now };
-    await DB.saveCard(saved, opt.img, opt.thumb);
+    try {
+      const pack = async b => b ? { buf: await b.arrayBuffer(), type: b.type || 'image/jpeg' } : null;
+      await DB.saveCard(saved, await pack(opt.img), await pack(opt.thumb));
+    } catch (err) { console.error(err); alert('保存に失敗しました: ' + (err && err.message || err)); return; }
     toast('保存しました');
     stack.length = 0; stack.push(['list', []]); show();
   };
@@ -304,7 +321,7 @@ async function viewDetail(id) {
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
     ${img ? `<dt>名刺画像</dt><dd><img id="im" alt=""></dd>` : ''}</dl></div>
     <button class="big danger" id="del">この名刺を削除</button>`;
-  if (img) { const u = URL.createObjectURL(img.blob); urls.push(u); $('#im').src = u; }
+  if (img) { const u = URL.createObjectURL(blobOf(img)); urls.push(u); $('#im').src = u; }
   $('#edit').onclick = () => go('form', id, {});
   $('#del').onclick = async () => {
     if (!confirm(`「${displayName(c)}」を削除します。元に戻せません。よろしいですか?`)) return;
