@@ -28,8 +28,8 @@ const DB = (() => {
     async saveCard(card, img, thumb) {
       const t = (await open()).transaction(['cards', 'images', 'thumbs'], 'readwrite');
       t.objectStore('cards').put(card);
-      // iPhoneでBlobの保存が不安定なため、バイト列として保存する
-      if (img) { t.objectStore('images').put({ id: card.id, buf: img.buf, type: img.type }); t.objectStore('thumbs').put({ id: card.id, buf: thumb.buf, type: thumb.type }); }
+      // iPhoneでBlobの保存が不安定なため、文字列(data URL)として保存する
+      if (img) { t.objectStore('images').put({ id: card.id, url: img }); t.objectStore('thumbs').put({ id: card.id, url: thumb }); }
       return done(t);
     },
     async delCard(id) {
@@ -63,8 +63,17 @@ function toCanvas(img, max) {
 const blobOf = r => r.blob || new Blob([r.buf], { type: r.type || 'image/jpeg' });
 // OCR用: グレースケール化+コントラスト補正(明暗の幅を広げる)
 function enhance(c) {
-  const g = c.getContext('2d'), d = g.getImageData(0, 0, c.width, c.height), p = d.data, h = new Uint32Array(256);
-  for (let i = 0; i < p.length; i += 4) { const y = (p[i] * 299 + p[i + 1] * 587 + p[i + 2] * 114) / 1000 | 0; p[i] = y; h[y]++; }
+  const g = c.getContext('2d'), W = c.width, H = c.height;
+  // 影や照明ムラを除く: 縮小→拡大でぼかした「背景の明るさ」で割る
+  const sm = document.createElement('canvas'); sm.width = Math.max(1, W >> 4); sm.height = Math.max(1, H >> 4);
+  const sg = sm.getContext('2d'); sg.imageSmoothingQuality = 'high'; sg.drawImage(c, 0, 0, sm.width, sm.height);
+  const bg = document.createElement('canvas'); bg.width = W; bg.height = H;
+  const bgc = bg.getContext('2d'); bgc.imageSmoothingQuality = 'high'; bgc.drawImage(sm, 0, 0, W, H);
+  const d = g.getImageData(0, 0, W, H), p = d.data, b = bgc.getImageData(0, 0, W, H).data, h = new Uint32Array(256);
+  for (let i = 0; i < p.length; i += 4) {
+    const y = (p[i] * 299 + p[i + 1] * 587 + p[i + 2] * 114) / 1000, by = (b[i] * 299 + b[i + 1] * 587 + b[i + 2] * 114) / 1000;
+    const v = Math.min(255, y * 235 / Math.max(by, 40)) | 0; p[i] = v; h[v]++;
+  }
   const n = p.length / 4; let lo = 0, hi = 255, s = 0;
   for (; lo < 255 && (s += h[lo]) < n * .01; lo++);
   for (s = 0; hi > 0 && (s += h[hi]) < n * .01; hi--);
@@ -90,23 +99,25 @@ async function runOCR(canvas, cb) {
   const w = await getWorker();
   await w.setParameters({ tessedit_pageseg_mode: '11' }); // 名刺は文字が点在するため疎なテキスト向けモード
   const { data } = await w.recognize(enhance(canvas));
-  return data.text || '';
+  return { text: data.text || '', lines: data.lines || [] };
 }
 
 /* ========== 読み取り結果 → 項目に振り分け ========== */
-function parseCard(raw) {
+function parseCard(raw, hl) {
   const CJK = '[\\u3040-\\u30ff\\u3400-\\u9fff\\uff00-\\uffef]';
   const squeeze = s => { const re = new RegExp(`(${CJK})[ \\t\\u3000]+(?=${CJK})`, 'g'); return s.replace(re, '$1'); };
   const TITLE_RE = /(部長|課長|取締役|社長|代表|主任|マネージャ|リーダー|室長|係長|所長|店長|教授|CEO|CTO|COO|CFO|President|Director|Manager|Engineer|Officer|Head|Lead|Chief|Representative|Professor)/i;
   const DEPT_RE = /(部|課|室|本部|センター|Department|Dept|Division|Team|チーム)$/i;
-  let orig = [];
-  raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 1).forEach(l => {
+  const orig = [], hs = [];
+  const src = hl && hl.length ? hl.map(x => ({ l: (x.text || '').trim(), h: x.bbox ? x.bbox.y1 - x.bbox.y0 : 0 })) : raw.split(/\r?\n/).map(l => ({ l: l.trim(), h: 0 }));
+  src.filter(x => x.l.length > 1).forEach(({ l, h }) => {
+    const push = (...a) => a.forEach(s => { orig.push(s); hs.push(h); });
     const toks = squeeze(l).split(/\s+/);
     // 「営業部 部長」のように部署と役職が同じ行にある場合は分ける
-    if (toks.length > 1 && !/[\d@]/.test(l) && toks.every(t => t.length > 1 && (TITLE_RE.test(t) || DEPT_RE.test(t)))) orig.push(...toks);
+    if (toks.length > 1 && !/[\d@]/.test(l) && toks.every(t => t.length > 1 && (TITLE_RE.test(t) || DEPT_RE.test(t)))) push(...toks);
     else {
       const sq = squeeze(l), m = !/[\d@]/.test(sq) && sq.match(/^(.{1,12}?(?:本部|事業部|部|課|室))(.{2,})$/);
-      if (m && TITLE_RE.test(m[2]) && !TITLE_RE.test(m[1])) orig.push(m[1], m[2]); else orig.push(l);
+      if (m && TITLE_RE.test(m[2]) && !TITLE_RE.test(m[1])) push(m[1], m[2]); else push(l);
     }
   });
   const lines = orig.map(squeeze);
@@ -140,21 +151,24 @@ function parseCard(raw) {
   r.address = addr.join(' ');
   lines.forEach((l, i) => { if (!used.has(i) && /株式会社|有限会社|合同会社|一般社団|\b(Inc|Corp|Co|Ltd|LLC|GmbH|Company|Corporation)\b\.?|大学|Group$|グループ$/i.test(l)) { if (!r.company) r.company = l; take(i); } });
   lines.forEach((l, i) => { if (!used.has(i) && /(部長|課長|取締役|社長|代表|主任|マネージャ|リーダー|室長|係長|所長|店長|教授|CEO|CTO|COO|CFO|President|Director|Manager|Engineer|Officer|Head|Lead|Chief|Representative|Professor)/i.test(l)) { if (!r.title) r.title = l; take(i); } });
-  lines.forEach((l, i) => { if (!used.has(i) && /(部|課|室|本部|センター|Department|Dept|Division|Team|チーム)$/i.test(l)) { if (!r.dept) r.dept = l; take(i); } });
+  lines.forEach((l, i) => { if (!used.has(i) && /(部|課|室|本部|センター|事業所|営業所|支店|支社|本社|工場|研究所|事務所|Department|Dept|Division|Branch|Office|Team|チーム)$/i.test(l)) { if (!r.dept) r.dept = l; take(i); } });
   lines.forEach((l, i) => { if (!used.has(i) && /^[぀-ゟ゠-ヿー\s]{3,24}$/.test(l)) { if (!r.yomi) r.yomi = kata2hira(l.replace(/\s/g, '')); take(i); } });
-  for (let i = 0; i < lines.length; i++) {
-    if (used.has(i)) continue;
-    const l = lines[i], o = orig[i];
-    if (/\d/.test(l) || l.length > 24) continue;
-    if (new RegExp(CJK).test(l)) {
-      const toks = o.split(/[ 　]+/);
-      if (toks.length === 2) { r.last = toks[0]; r.first = toks[1]; } else r.last = l;
-      take(i); break;
-    }
-    if (/^[A-Za-z][A-Za-z.'\- ]+$/.test(l) && l.split(/\s+/).length <= 4) {
-      const p = l.split(/\s+/); r.last = p.length > 1 ? p[p.length - 1] : l; r.first = p.length > 1 ? p.slice(0, -1).join(' ') : '';
-      r.country = ''; take(i); break;
-    }
+  // 名前候補: 組織名らしい行を除き、最も大きい文字(名刺では名前が最大のことが多い)を選ぶ
+  const ORG = /事業所|営業所|支店|支社|本社|工場|研究所|事務所|センター|病院|学校|大学|協会|組合|銀行|法人|株式|会社|店$|部$|課$|室$|Inc|Corp|Ltd|LLC|Co\.|Office|Branch|Dept|Division|Group/i;
+  const cands = [];
+  lines.forEach((l, i) => {
+    if (used.has(i) || /\d|@/.test(l) || l.length > 12 || ORG.test(l)) return;
+    if (new RegExp(CJK).test(l) && l.length >= 2) cands.push({ i, jp: true });
+    else if (/^[A-Za-z][A-Za-z.'\- ]+$/.test(l) && l.split(/\s+/).length <= 4) cands.push({ i, jp: false });
+  });
+  const pool = cands.some(c => c.jp) ? cands.filter(c => c.jp) : cands;
+  pool.sort((a, b) => (hs[b.i] - hs[a.i]) || (a.i - b.i));
+  const best = pool[0];
+  if (best) {
+    const l = lines[best.i], o = orig[best.i];
+    if (best.jp) { const toks = o.split(/[ 　]+/); if (toks.length === 2) { r.last = toks[0]; r.first = toks[1]; } else r.last = l; }
+    else { const p = l.split(/\s+/); r.last = p.length > 1 ? p[p.length - 1] : l; r.first = p.length > 1 ? p.slice(0, -1).join(' ') : ''; }
+    take(best.i);
   }
   if (new RegExp('[\\u3040-\\u30ff\\u4e00-\\u9fff]').test(raw) && /〒|都|道|府|県|\+81|^0/.test(r.address + r.tel)) r.country = '日本';
   const rest = lines.filter((_, i) => !used.has(i));
@@ -191,7 +205,7 @@ async function viewList() {
     <div class="count" id="cnt"></div><div id="listBox"></div>
     <button class="fab" id="add">＋ 撮影</button>`;
   const cards = await DB.all('cards');
-  const thumbs = new Map((await DB.all('thumbs')).map(t => [t.id, blobOf(t)]));
+  const thumbs = new Map((await DB.all('thumbs')).map(t => [t.id, t.url]));
   const draw = () => {
     revokeUrls();
     document.querySelectorAll('#sortSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === ui.sort));
@@ -207,7 +221,7 @@ async function viewList() {
       let img = '';
       if (ui.mode === 'image') {
         const b = thumbs.get(c.id);
-        if (b) { const u = URL.createObjectURL(b); urls.push(u); img = `<img src="${u}" alt="">`; } else img = '<div class="noimg">画像なし</div>';
+        if (b) img = `<img src="${b}" alt="">`; else img = '<div class="noimg">画像なし</div>';
       }
       return `<div class="row" data-id="${c.id}">${img}<div class="t"><div class="n">${esc(displayName(c))}</div><div class="s">${esc([c.company, c.title].filter(Boolean).join(' / '))}</div></div></div>`;
     }).join('')}</div>` : `<div class="empty">${cards.length ? '該当する名刺がありません' : '名刺がまだありません<br>右下の「＋ 撮影」から追加しましょう'}</div>`;
@@ -247,15 +261,15 @@ async function viewScan() {
       pt.textContent = '画像を処理中…';
       const bmp = await loadImage(f);
       const full = toCanvas(bmp, 1600), ocrC = toCanvas(bmp, 2000), th = toCanvas(bmp, 320);
-      const imgBlob = await toBlob(full, .8), thBlob = await toBlob(th, .7);
-      const u = URL.createObjectURL(imgBlob); urls.push(u); $('#pv').src = u;
+      const imgBlob = full.toDataURL('image/jpeg', .8), thBlob = th.toDataURL('image/jpeg', .7);
+      $('#pv').src = imgBlob;
       pt.textContent = '読み取りエンジンを準備中…(初回は少し時間がかかります)';
-      const text = await runOCR(ocrC, m => {
+      const ocr = await runOCR(ocrC, m => {
         if (m.status === 'recognizing text') { pb.style.width = Math.round(m.progress * 100) + '%'; pt.textContent = `文字を読み取り中… ${Math.round(m.progress * 100)}%`; }
         else pt.textContent = '準備中…';
       });
       const keep = $('#saveImg').checked;
-      stack.pop(); go('form', null, { prefill: parseCard(text), img: keep ? imgBlob : null, thumb: keep ? thBlob : null, raw: text });
+      stack.pop(); go('form', null, { prefill: parseCard(ocr.text, ocr.lines), img: keep ? imgBlob : null, thumb: keep ? thBlob : null, raw: ocr.text });
     } catch (err) {
       console.error(err);
       pt.textContent = '読み取りに失敗しました: ' + (err && err.message || err) + '(手入力でも登録できます)';
@@ -286,7 +300,7 @@ async function viewForm(id, opt = {}) {
     const input = type === 'textarea' ? `<textarea ${a}>${esc(val[k])}</textarea>` : `<input ${a} type="${type || 'text'}" value="${esc(val[k])}" ${type === 'email' ? 'inputmode="email" autocapitalize="off"' : ''} ${type === 'tel' ? 'inputmode="tel"' : ''}>`;
     return `<div class="f"><label for="f_${k}">${label}</label>${input}</div>`;
   }
-  if (opt.img) { const u = URL.createObjectURL(opt.img); urls.push(u); $('#pv').src = u; }
+  if (opt.img) $('#pv').src = opt.img;
   $('#frm').onsubmit = async e => {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(e.target).entries());
@@ -296,8 +310,7 @@ async function viewForm(id, opt = {}) {
     const now = Date.now();
     const saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, updatedAt: now };
     try {
-      const pack = async b => b ? { buf: await b.arrayBuffer(), type: b.type || 'image/jpeg' } : null;
-      await DB.saveCard(saved, await pack(opt.img), await pack(opt.thumb));
+      await DB.saveCard(saved, opt.img, opt.thumb);
     } catch (err) { console.error(err); alert('保存に失敗しました: ' + (err && err.message || err)); return; }
     toast('保存しました');
     stack.length = 0; stack.push(['list', []]); show();
@@ -321,7 +334,7 @@ async function viewDetail(id) {
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
     ${img ? `<dt>名刺画像</dt><dd><img id="im" alt=""></dd>` : ''}</dl></div>
     <button class="big danger" id="del">この名刺を削除</button>`;
-  if (img) { const u = URL.createObjectURL(blobOf(img)); urls.push(u); $('#im').src = u; }
+  if (img) $('#im').src = img.url;
   $('#edit').onclick = () => go('form', id, {});
   $('#del').onclick = async () => {
     if (!confirm(`「${displayName(c)}」を削除します。元に戻せません。よろしいですか?`)) return;
