@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = '4';
+const APP_VERSION = '5';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -15,9 +15,13 @@ const FIELDS = [
 /* ========== IndexedDB(端末内のみ) ========== */
 const DB = (() => {
   let p;
+  const STORES = ['cards', 'images', 'thumbs', 'folders'];
   const open = () => p ||= new Promise((res, rej) => {
-    const r = indexedDB.open('meishi', 1);
-    r.onupgradeneeded = () => { const d = r.result; ['cards', 'images', 'thumbs'].forEach(n => d.createObjectStore(n, { keyPath: 'id' })); d.createObjectStore('settings', { keyPath: 'key' }); };
+    const r = indexedDB.open('meishi', 2);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      [...STORES, 'settings'].forEach(n => { if (!d.objectStoreNames.contains(n)) d.createObjectStore(n, { keyPath: n === 'settings' ? 'key' : 'id' }); });
+    };
     r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
   });
   const rq = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -26,6 +30,8 @@ const DB = (() => {
   return {
     all: async n => rq((await st(n)).getAll()),
     get: async (n, id) => rq((await st(n)).get(id)),
+    put: async (n, v) => rq((await st(n, 'readwrite')).put(v)),
+    del: async (n, id) => rq((await st(n, 'readwrite')).delete(id)),
     async saveCard(card, img, thumb) {
       const t = (await open()).transaction(['cards', 'images', 'thumbs'], 'readwrite');
       t.objectStore('cards').put(card);
@@ -36,6 +42,21 @@ const DB = (() => {
     async delCard(id) {
       const t = (await open()).transaction(['cards', 'images', 'thumbs'], 'readwrite');
       ['cards', 'images', 'thumbs'].forEach(n => t.objectStore(n).delete(id));
+      return done(t);
+    },
+    async delImage(id) {
+      const t = (await open()).transaction(['images', 'thumbs'], 'readwrite');
+      ['images', 'thumbs'].forEach(n => t.objectStore(n).delete(id));
+      return done(t);
+    },
+    // バックアップからの復元(現在のデータをすべて置き換え)
+    async replaceAll(data) {
+      const t = (await open()).transaction(STORES, 'readwrite');
+      STORES.forEach(n => t.objectStore(n).clear());
+      (data.cards || []).forEach(v => t.objectStore('cards').put(v));
+      (data.folders || []).forEach(v => t.objectStore('folders').put(v));
+      (data.images || []).forEach(v => t.objectStore('images').put(v));
+      (data.thumbs || []).forEach(v => t.objectStore('thumbs').put(v));
       return done(t);
     },
     async setting(key, def) { const r = await rq((await st('settings')).get(key)); return r ? r.value : def; },
@@ -187,19 +208,49 @@ function back() { stack.pop(); show(); }
 function show() {
   revokeUrls();
   const [view, args] = stack[stack.length - 1] || ['list', []];
-  backBtn.hidden = stack.length <= 1; hright.innerHTML = '';
+  backBtn.hidden = stack.length <= 1; hright.innerHTML = ''; app.onclick = null;
   window.scrollTo(0, 0);
-  ({ list: viewList, scan: viewScan, form: viewForm, detail: viewDetail })[view](...args);
+  ({ list: viewList, scan: viewScan, form: viewForm, detail: viewDetail, settings: viewSettings, folders: viewFolders })[view](...args);
 }
 backBtn.onclick = back;
+const goList = () => { stack.length = 0; stack.push(['list', []]); show(); };
+
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const norm = s => (s || '').replace(/[\s　]/g, '').toLowerCase();
+const sortedFolders = async () => (await DB.all('folders')).sort((a, b) => cmp(a.name, b.name));
+const toDataUrl = blob => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); });
+
+function modal(title, msg, buttons) {
+  const el = document.createElement('div'); el.className = 'modal';
+  el.innerHTML = `<div class="box"><h3>${esc(title)}</h3><p>${esc(msg)}</p>${buttons.map((b, i) => `<button class="big ${b.cls || 'alt'}" data-i="${i}">${esc(b.label)}</button>`).join('')}</div>`;
+  document.body.append(el);
+  return new Promise(res => { el.onclick = e => { const b = e.target.closest('button'); if (b) { el.remove(); res(+b.dataset.i); } }; });
+}
+
+// ファイルを保存(共有シート → ファイルAppに保存できる。無理なら通常のダウンロード)
+async function saveFile(name, blob) {
+  const file = new File([blob], name, { type: blob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return true; } catch (e) { if (e.name === 'AbortError') return false; }
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000); return true;
+}
 
 /* ----- 一覧 ----- */
-const ui = { sort: 'name', mode: 'image', q: '' };
+const ui = { sort: 'name', mode: 'image', q: '', folder: '' };
+let reminded = false;
 async function viewList() {
   titleEl.textContent = '名刺管理';
+  hright.innerHTML = '<button class="hbtn" id="gear">設定</button>';
+  $('#gear').onclick = () => go('settings');
   ui.mode = await DB.setting('listMode', 'image');
+  const folders = await sortedFolders();
+  if (ui.folder && !folders.some(f => f.id === ui.folder)) ui.folder = '';
   app.innerHTML = `
-    <input class="search" id="q" type="search" placeholder="検索(名前・会社・国・メモ)" value="${esc(ui.q)}">
+    <div id="warn"></div>
+    <input class="search" id="q" type="search" placeholder="検索(名前・会社・国・メモ・面談記録)" value="${esc(ui.q)}">
+    <div class="chips" id="chips"><button data-f="">すべて</button>${folders.map(f => `<button data-f="${f.id}">${esc(f.name)}</button>`).join('')}<button data-f="__edit" class="edit">＋ 編集</button></div>
     <div class="seg" id="sortSeg">
       <button data-v="name">名前順</button><button data-v="company">会社名順</button><button data-v="met">最終面談日順</button></div>
     <div class="seg" id="modeSeg"><button data-v="image">画像付き</button><button data-v="text">文字だけ</button></div>
@@ -208,11 +259,12 @@ async function viewList() {
   const cards = await DB.all('cards');
   const thumbs = new Map((await DB.all('thumbs')).map(t => { let u = t.url; if (!u && (t.blob || t.buf)) { u = URL.createObjectURL(blobOf(t)); } return [t.id, u]; }));
   const draw = () => {
-    revokeUrls();
+    document.querySelectorAll('#chips button').forEach(b => b.classList.toggle('on', b.dataset.f === ui.folder));
     document.querySelectorAll('#sortSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === ui.sort));
     document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === ui.mode));
     const q = ui.q.trim().toLowerCase();
-    let L = cards.filter(c => !q || [c.last, c.first, c.yomi, c.company, c.dept, c.title, c.country, c.email, c.memo, ...(c.meetings || []).map(m => `${m.place} ${m.note}`)].join('\n').toLowerCase().includes(q));
+    let L = cards.filter(c => (!ui.folder || (c.folders || []).includes(ui.folder)) &&
+      (!q || [c.last, c.first, c.yomi, c.company, c.dept, c.title, c.country, c.email, c.memo, ...(c.meetings || []).map(m => `${m.place} ${m.note}`)].join('\n').toLowerCase().includes(q)));
     const by = { name: c => sortKey(c), company: c => kata2hira((c.company || '').toLowerCase()), met: c => lastMet(c) };
     L.sort(ui.sort === 'met'
       ? (a, b) => (lastMet(b) ? 1 : 0) - (lastMet(a) ? 1 : 0) || cmp(lastMet(b), lastMet(a)) || cmp(sortKey(a), sortKey(b))
@@ -228,7 +280,16 @@ async function viewList() {
     }).join('')}</div>` : `<div class="empty">${cards.length ? '該当する名刺がありません' : '名刺がまだありません<br>右下の「＋ 撮影」から追加しましょう'}</div>`;
   };
   draw();
+  // バックアップのお知らせ(前回から1か月以上)
+  const last = await DB.setting('lastBackup', 0), first = await DB.setting('firstUse', Date.now());
+  const overdue = cards.length > 0 && Date.now() - (last || first) > 30 * 86400000;
+  if (overdue) {
+    $('#warn').innerHTML = `<div class="panel warn">${last ? '前回のバックアップから1か月以上たっています。' : 'まだバックアップを取っていません。'}<button class="link" id="goBk">バックアップする</button></div>`;
+    $('#goBk').onclick = () => go('settings');
+    if (!reminded) { reminded = true; if (await modal('バックアップのお知らせ', last ? '前回のバックアップから1か月以上たっています。バックアップを取りますか?' : 'まだバックアップを取っていません。バックアップを取りますか?', [{ label: '設定を開く', cls: '' }, { label: 'あとで' }]) === 0) go('settings'); }
+  }
   $('#q').oninput = e => { ui.q = e.target.value; draw(); };
+  $('#chips').onclick = e => { const f = e.target.dataset.f; if (f === '__edit') go('folders'); else if (f !== undefined) { ui.folder = f; draw(); } };
   $('#sortSeg').onclick = e => { if (e.target.dataset.v) { ui.sort = e.target.dataset.v; draw(); } };
   $('#modeSeg').onclick = async e => { if (e.target.dataset.v) { ui.mode = e.target.dataset.v; await DB.setSetting('listMode', ui.mode); draw(); } };
   $('#listBox').onclick = e => { const r = e.target.closest('.row'); if (r) go('detail', r.dataset.id); };
@@ -283,8 +344,10 @@ async function viewScan() {
 /* ----- 確認・修正・保存 ----- */
 async function viewForm(id, opt = {}) {
   let card = id ? await DB.get('cards', id) : null;
+  const folders = await sortedFolders();
   titleEl.textContent = card ? '名刺を編集' : '内容を確認';
   const v = card || opt.prefill || {};
+  const selFolders = card ? (card.folders || []) : (ui.folder ? [ui.folder] : []);
   app.innerHTML = `
     <form id="frm">
       ${opt.img ? `<div class="panel"><img class="preview" id="pv" alt=""></div>` : ''}
@@ -295,6 +358,7 @@ async function viewForm(id, opt = {}) {
       <p class="sub">読み取り結果です。間違いがあれば直してから保存してください。</p>
       <div class="two">${['last', 'first'].map(k => fld(k, v)).join('')}</div>
       ${FIELDS.slice(2).map(f => fld(f[0], v)).join('')}
+      ${folders.length ? `<div class="f"><label>フォルダ(複数選べます)</label><div class="tags">${folders.map(f => `<label class="chk"><input type="checkbox" name="fo" value="${f.id}" ${selFolders.includes(f.id) ? 'checked' : ''}> ${esc(f.name)}</label>`).join('')}</div></div>` : ''}
       <button class="big" type="submit">保存</button>
     </form>
     <datalist id="countries">${['日本', 'アメリカ', 'イギリス', '中国', '韓国', '台湾', 'シンガポール', 'インド', 'ドイツ', 'フランス', 'オーストラリア', 'カナダ'].map(c => `<option value="${c}">`).join('')}</datalist>`;
@@ -312,17 +376,41 @@ async function viewForm(id, opt = {}) {
   };
   $('#frm').onsubmit = async e => {
     e.preventDefault();
-    const d = Object.fromEntries(new FormData(e.target).entries());
+    const fd = new FormData(e.target), fo = fd.getAll('fo'); fd.delete('fo');
+    const d = Object.fromEntries(fd.entries());
     for (const k in d) d[k] = d[k].trim();
     d.yomi = kata2hira(d.yomi);
     if (!d.last && !d.first && !d.company) { toast('名前か会社名を入力してください'); return; }
     const now = Date.now();
-    const saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, updatedAt: now };
+    let saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, folders: fo, updatedAt: now };
+    let img = opt.img, thumb = opt.thumb;
     try {
-      await DB.saveCard(saved, opt.img, opt.thumb);
+      if (!card) {
+        // 重複チェック(名前またはメールが同じ)
+        const all = await DB.all('cards');
+        const nm = norm(d.last) + norm(d.first);
+        const dup = all.find(x => (norm(d.email) && norm(x.email) === norm(d.email)) || (nm && nm === norm(x.last) + norm(x.first)));
+        if (dup) {
+          const why = norm(d.email) && norm(dup.email) === norm(d.email) ? 'メールアドレス' : '名前';
+          const c = await modal('登録済みの可能性があります', `${why}が同じ名刺があります:\n${displayName(dup)}${dup.company ? ' / ' + dup.company : ''}\n\nどうしますか?`, [
+            { label: '統合する(空欄だけ補う)', cls: '' }, { label: '上書きする(新しい内容に置き換え)' }, { label: '別の人として登録' }, { label: 'キャンセル', cls: 'danger' }]);
+          if (c === 3) return;
+          if (c === 0 || c === 1) {
+            const folderUnion = [...new Set([...(dup.folders || []), ...fo])];
+            if (c === 1) saved = { ...dup, ...d, folders: folderUnion, updatedAt: now };
+            else {
+              saved = { ...dup, folders: folderUnion, updatedAt: now };
+              FIELDS.forEach(([k]) => { saved[k] = dup[k] || d[k] || ''; });
+              if (dup.memo && d.memo && dup.memo !== d.memo) saved.memo = dup.memo + '\n' + d.memo;
+              if (await DB.get('images', dup.id)) { img = null; thumb = null; }
+            }
+          }
+        }
+      }
+      await DB.saveCard(saved, img, thumb);
     } catch (err) { console.error(err); alert('保存に失敗しました: ' + (err && err.message || err)); return; }
     toast('保存しました');
-    stack.length = 0; stack.push(['list', []]); show();
+    goList();
   };
 }
 
@@ -330,27 +418,140 @@ async function viewForm(id, opt = {}) {
 async function viewDetail(id) {
   const c = await DB.get('cards', id);
   if (!c) { back(); return; }
+  const folders = await sortedFolders();
   titleEl.textContent = displayName(c);
   hright.innerHTML = '<button class="hbtn" id="edit">編集</button>';
   const img = await DB.get('images', id);
   const dig = s => s.replace(/[^\d+]/g, '');
   const show1 = (label, html) => html ? `<dt>${label}</dt><dd>${html}</dd>` : '';
   const tel = s => s ? `<a href="tel:${esc(dig(s))}">${esc(s)}</a>` : '';
+  const ms = [...(c.meetings || [])].sort((a, b) => cmp(b.date, a.date));
   app.innerHTML = `<div class="panel d"><dl style="margin:0">
     ${show1('名前', esc(displayName(c)))}${show1('読み', esc(c.yomi))}${show1('会社名', esc(c.company))}${show1('部署', esc(c.dept))}${show1('役職', esc(c.title))}${show1('国', esc(c.country))}
     ${show1('メール', c.email ? `<a href="mailto:${esc(c.email)}">${esc(c.email)}</a>` : '')}
     ${show1('会社電話', tel(c.tel))}${show1('携帯電話', tel(c.mobile))}${show1('FAX', esc(c.fax))}
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
-    ${img ? `<dt>名刺画像</dt><dd><img id="im" alt=""></dd>` : ''}</dl></div>
+    </dl></div>
+    <div class="panel"><h3>フォルダ</h3>${folders.length ? `<div class="tags" id="fol">${folders.map(f => `<button type="button" class="chip ${(c.folders || []).includes(f.id) ? 'on' : ''}" data-f="${f.id}">${esc(f.name)}</button>`).join('')}</div>` : '<div class="sub">フォルダはまだありません(一覧の「＋ 編集」で作れます)</div>'}</div>
+    <div class="panel"><h3>面談記録</h3>
+      ${ms.length ? ms.map(m => `<div class="mt"><div><b>${esc(m.date)}</b> ${esc(m.place)}<button class="link" data-md="${m.id}" style="float:right">削除</button></div><div class="sub" style="white-space:pre-wrap">${esc(m.note)}</div></div>`).join('') : '<div class="sub">まだ記録がありません</div>'}
+      <button class="big alt" id="madd" style="margin-top:10px">＋ 面談を追加</button>
+      <form id="mform" hidden>
+        <div class="f"><label>日付</label><input type="date" name="date" value="${today()}" required></div>
+        <div class="f"><label>場所</label><input name="place"></div>
+        <div class="f"><label>内容</label><textarea name="note"></textarea></div>
+        <button class="big" type="submit">記録を保存</button></form></div>
+    ${img ? `<div class="panel d"><h3>名刺画像</h3><img id="im" alt=""><button class="link" id="delimg" style="margin-top:8px">この画像だけ削除</button></div>` : ''}
     <button class="big danger" id="del">この名刺を削除</button>`;
   if (img) { let u = img.url; if (!u) { u = URL.createObjectURL(blobOf(img)); urls.push(u); } $('#im').src = u; }
   $('#edit').onclick = () => go('form', id, {});
+  const fol = $('#fol');
+  if (fol) fol.onclick = async e => {
+    const f = e.target.dataset.f; if (!f) return;
+    const s = new Set(c.folders || []); s.has(f) ? s.delete(f) : s.add(f);
+    c.folders = [...s]; await DB.put('cards', c); viewDetail(id);
+  };
+  $('#madd').onclick = () => { $('#mform').hidden = !$('#mform').hidden; };
+  $('#mform').onsubmit = async e => {
+    e.preventDefault(); const fd = new FormData(e.target);
+    c.meetings = [...(c.meetings || []), { id: uid(), date: fd.get('date'), place: fd.get('place').trim(), note: fd.get('note').trim() }];
+    c.updatedAt = Date.now(); await DB.put('cards', c); toast('面談を記録しました'); viewDetail(id);
+  };
+  app.onclick = async e => {
+    const md = e.target.dataset.md; if (!md) return;
+    if (!confirm('この面談記録を削除しますか?')) return;
+    c.meetings = c.meetings.filter(m => m.id !== md); await DB.put('cards', c); viewDetail(id);
+  };
+  if ($('#delimg')) $('#delimg').onclick = async () => {
+    if (!confirm('名刺の画像だけを削除します(文字情報は残ります)。よろしいですか?')) return;
+    await DB.delImage(id); toast('画像を削除しました'); viewDetail(id);
+  };
   $('#del').onclick = async () => {
     if (!confirm(`「${displayName(c)}」を削除します。元に戻せません。よろしいですか?`)) return;
     await DB.delCard(id); toast('削除しました'); back();
   };
 }
 
+/* ----- フォルダ管理 ----- */
+async function viewFolders() {
+  titleEl.textContent = 'フォルダ';
+  const folders = await sortedFolders(), cards = await DB.all('cards');
+  app.innerHTML = `<div class="panel">
+    ${folders.length ? folders.map(f => `<div class="frow" data-id="${f.id}"><span>${esc(f.name)} <span class="sub">${cards.filter(c => (c.folders || []).includes(f.id)).length}件</span></span><span><button class="link" data-a="ren">名前変更</button><button class="link" data-a="del" style="color:var(--danger)">削除</button></span></div>`).join('') : '<div class="sub">フォルダはまだありません</div>'}
+    </div><button class="big" id="newf">＋ フォルダを作成</button>
+    <p class="sub">1枚の名刺を複数のフォルダに入れられます。フォルダを削除しても、名刺は「すべて」に残ります。</p>`;
+  $('#newf').onclick = async () => {
+    const n = (prompt('フォルダ名') || '').trim(); if (!n) return;
+    await DB.put('folders', { id: uid(), name: n, createdAt: Date.now() }); viewFolders();
+  };
+  app.onclick = async e => {
+    const a = e.target.dataset.a, row = e.target.closest('.frow'); if (!a || !row) return;
+    const f = folders.find(x => x.id === row.dataset.id);
+    if (a === 'ren') { const n = (prompt('新しいフォルダ名', f.name) || '').trim(); if (!n) return; f.name = n; await DB.put('folders', f); }
+    else {
+      if (!confirm(`フォルダ「${f.name}」を削除します。名刺は削除されません。よろしいですか?`)) return;
+      for (const c of cards) if ((c.folders || []).includes(f.id)) { c.folders = c.folders.filter(x => x !== f.id); await DB.put('cards', c); }
+      await DB.del('folders', f.id);
+    }
+    viewFolders();
+  };
+}
+
+/* ----- 設定・バックアップ・CSV ----- */
+function csvCell(v) { v = String(v ?? ''); return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+async function viewSettings() {
+  titleEl.textContent = '設定';
+  const saveImg = await DB.setting('saveImage', true), last = await DB.setting('lastBackup', 0), folders = await sortedFolders();
+  app.innerHTML = `
+    <div class="panel"><label class="sw"><span>名刺の画像を保存する</span><input type="checkbox" id="saveImg" ${saveImg ? 'checked' : ''}></label>
+      <p class="sub">オフにすると、これから登録する名刺には画像を保存しません。すでにある画像は、各名刺の詳細から個別に削除できます。</p></div>
+    <div class="panel"><h3>フォルダ</h3><button class="big alt" id="gofol" style="margin:0">フォルダを作成・名前変更・削除</button></div>
+    <div class="panel"><h3>バックアップ(完全)</h3>
+      <p class="sub">前回: ${last ? new Date(last).toLocaleDateString('ja-JP') : 'まだありません'}<br>名刺・フォルダ・面談記録・画像をすべて含むJSONファイルです。書き出したら「ファイルに保存」を選んでください。</p>
+      <button class="big" id="bk">バックアップを書き出す</button>
+      <button class="big alt" id="rs">バックアップから復元</button>
+      <input type="file" id="fRs" accept=".json,application/json" hidden>
+      <p class="sub">復元すると、いまの端末内のデータはすべて置き換わります。</p></div>
+    <div class="panel"><h3>CSV書き出し(Excel用)</h3>
+      <div class="f"><select id="csvSel"><option value="">すべて</option>${folders.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join('')}<option value="__each">フォルダごとに別ファイル</option></select></div>
+      <button class="big alt" id="csv" style="margin:0">CSVを書き出す</button></div>
+    <p class="sub" style="text-align:center">版 ${APP_VERSION} / データはこの端末内にのみ保存されます</p>`;
+  $('#saveImg').onchange = e => DB.setSetting('saveImage', e.target.checked);
+  $('#gofol').onclick = () => go('folders');
+  $('#bk').onclick = async () => {
+    const [cards, fol, imgs, ths] = await Promise.all(['cards', 'folders', 'images', 'thumbs'].map(n => DB.all(n)));
+    const fix = async r => ({ id: r.id, url: r.url || await toDataUrl(blobOf(r)) });
+    const data = { app: 'meishi', version: 1, exportedAt: new Date().toISOString(), cards, folders: fol, images: await Promise.all(imgs.map(fix)), thumbs: await Promise.all(ths.map(fix)) };
+    if (await saveFile(`名刺バックアップ_${today()}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' }))) {
+      await DB.setSetting('lastBackup', Date.now()); toast('バックアップを書き出しました'); viewSettings();
+    }
+  };
+  $('#rs').onclick = () => $('#fRs').click();
+  $('#fRs').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const data = JSON.parse(await f.text());
+      if (data.app !== 'meishi' || !Array.isArray(data.cards)) throw new Error('このアプリのバックアップではありません');
+      if (!confirm(`バックアップ(名刺${data.cards.length}件)から復元します。いまのデータはすべて置き換わります。よろしいですか?`)) return;
+      await DB.replaceAll(data); toast('復元しました'); goList();
+    } catch (err) { alert('復元に失敗しました: ' + (err && err.message || err)); }
+    e.target.value = '';
+  };
+  $('#csv').onclick = async () => {
+    const cards = await DB.all('cards'), sel = $('#csvSel').value, fmap = new Map(folders.map(f => [f.id, f.name]));
+    const head = ['姓', '名', '読み', '会社名', '部署', '役職', '国', 'メール', '会社電話', '携帯電話', 'FAX', '住所', 'メモ', 'フォルダ', '最終面談日', '面談記録'];
+    const make = list => '﻿' + [head, ...list.sort((a, b) => cmp(sortKey(a), sortKey(b))).map(c => [
+      c.last, c.first, c.yomi, c.company, c.dept, c.title, c.country, c.email, c.tel, c.mobile, c.fax, c.address, c.memo,
+      (c.folders || []).map(i => fmap.get(i)).filter(Boolean).join(' / '), lastMet(c),
+      [...(c.meetings || [])].sort((a, b) => cmp(a.date, b.date)).map(m => `${m.date} ${m.place} ${m.note}`.trim()).join('\n')])].map(r => r.map(csvCell).join(',')).join('\r\n');
+    const safe = s => s.replace(/[\\/:*?"<>|]/g, '_');
+    const targets = sel === '__each' ? folders.map(f => [f.name, cards.filter(c => (c.folders || []).includes(f.id))]) : [[sel ? fmap.get(sel) : 'すべて', sel ? cards.filter(c => (c.folders || []).includes(sel)) : cards]];
+    if (!targets.length) { toast('フォルダがありません'); return; }
+    for (const [name, list] of targets) await saveFile(`名刺_${safe(name)}_${today()}.csv`, new Blob([make(list)], { type: 'text/csv' }));
+  };
+}
+
 /* ========== 起動 ========== */
+DB.setting('firstUse', 0).then(v => v || DB.setSetting('firstUse', Date.now()));
 stack.push(['list', []]); show();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(console.error);
