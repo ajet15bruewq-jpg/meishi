@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = '7';
+const APP_VERSION = '8';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -252,6 +252,28 @@ function saveFiles(list) {
   });
 }
 
+/* ----- フォルダ選択(複数選択+「入れない」) ----- */
+const folderRow = (f, on) => `<label class="fchk"><input type="checkbox" name="fo" value="${f.id}" ${on ? 'checked' : ''}><span class="nm">${esc(f.name)}</span><span class="st"></span></label>`;
+const pickerHTML = (folders, sel) => `<div class="fsel" id="fpick">
+  <label class="fchk"><input type="checkbox" id="fnone" ${sel.length ? '' : 'checked'}><span class="nm">フォルダに入れない</span><span class="st"></span></label>
+  ${folders.map(f => folderRow(f, sel.includes(f.id))).join('')}</div>
+  <button type="button" class="link" id="newfold">＋ 新しいフォルダを作る</button>`;
+function wirePicker(onChange) {
+  const root = $('#fpick'), none = $('#fnone');
+  const fs = () => [...root.querySelectorAll('input[name=fo]')];
+  const report = () => onChange && onChange(fs().filter(i => i.checked).map(i => i.value));
+  root.onchange = e => {
+    if (e.target === none) { if (none.checked) fs().forEach(i => i.checked = false); else if (!fs().some(i => i.checked)) none.checked = true; }
+    else none.checked = !fs().some(i => i.checked);
+    report();
+  };
+  $('#newfold').onclick = async () => {
+    const n = (prompt('フォルダ名') || '').trim(); if (!n) return;
+    const f = { id: uid(), name: n, createdAt: Date.now() };
+    await DB.put('folders', f); root.insertAdjacentHTML('beforeend', folderRow(f, true)); none.checked = false; report();
+  };
+}
+
 /* ----- 一覧 ----- */
 const ui = { sort: 'name', mode: 'image', q: '', folder: '' };
 let reminded = false;
@@ -373,7 +395,12 @@ async function viewForm(id, opt = {}) {
       <p class="sub">読み取り結果です。間違いがあれば直してから保存してください。</p>
       <div class="two">${['last', 'first'].map(k => fld(k, v)).join('')}</div>
       ${FIELDS.slice(2).map(f => fld(f[0], v)).join('')}
-      ${folders.length ? `<div class="f"><label>この名刺を入れるフォルダ(チェックしたフォルダに入ります。複数OK)</label><div class="fsel">${folders.map(f => `<label class="fchk"><input type="checkbox" name="fo" value="${f.id}" ${selFolders.includes(f.id) ? 'checked' : ''}><span class="nm">${esc(f.name)}</span><span class="st"></span></label>`).join('')}</div></div>` : ''}
+      <div class="f"><label>この名刺を入れるフォルダ(複数選べます)</label>${pickerHTML(folders, selFolders)}</div>
+      ${card ? '' : `<details class="panel" id="mdet"><summary class="sub">面談記録を最初に書く(任意)</summary>
+        <div class="f"><label>日付</label><input type="date" name="m_date" value="${today()}"></div>
+        <div class="f"><label>場所</label><input name="m_place"></div>
+        <div class="f"><label>内容</label><textarea name="m_note"></textarea></div>
+        <p class="sub">場所か内容を入力すると、面談記録として一緒に保存されます。</p></details>`}
       <button class="big" type="submit">保存</button>
     </form>
     <datalist id="countries">${['日本', 'アメリカ', 'イギリス', '中国', '韓国', '台湾', 'シンガポール', 'インド', 'ドイツ', 'フランス', 'オーストラリア', 'カナダ'].map(c => `<option value="${c}">`).join('')}</datalist>`;
@@ -383,6 +410,7 @@ async function viewForm(id, opt = {}) {
     const input = type === 'textarea' ? `<textarea ${a}>${esc(val[k])}</textarea>` : `<input ${a} type="${type || 'text'}" value="${esc(val[k])}" ${type === 'email' ? 'inputmode="email" autocapitalize="off"' : ''} ${type === 'tel' ? 'inputmode="tel"' : ''}>`;
     return `<div class="f"><label for="f_${k}">${label}</label>${input}</div>`;
   }
+  wirePicker();
   if (opt.img) $('#pv').src = opt.img;
   if ($('#reparse')) $('#reparse').onclick = () => {
     const p = parseCard($('#rawTxt').value);
@@ -392,6 +420,8 @@ async function viewForm(id, opt = {}) {
   $('#frm').onsubmit = async e => {
     e.preventDefault();
     const fd = new FormData(e.target), fo = fd.getAll('fo'); fd.delete('fo');
+    const mt = { date: fd.get('m_date') || today(), place: (fd.get('m_place') || '').trim(), note: (fd.get('m_note') || '').trim() };
+    ['m_date', 'm_place', 'm_note'].forEach(k => fd.delete(k));
     const d = Object.fromEntries(fd.entries());
     for (const k in d) d[k] = d[k].trim();
     d.yomi = kata2hira(d.yomi);
@@ -423,6 +453,7 @@ async function viewForm(id, opt = {}) {
           }
         }
       }
+      if (!card && (mt.place || mt.note)) saved.meetings = [...(saved.meetings || []), { id: uid(), ...mt }];
       await DB.saveCard(saved, img, thumb);
     } catch (err) { console.error(err); alert('保存に失敗しました: ' + (err && err.message || err)); return; }
     toast('保存しました');
@@ -448,7 +479,7 @@ async function viewDetail(id) {
     ${show1('会社電話', tel(c.tel))}${show1('携帯電話', tel(c.mobile))}${show1('FAX', esc(c.fax))}
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
     </dl></div>
-    <div class="panel"><h3>この名刺を入れるフォルダ</h3>${folders.length ? `<p class="sub" style="margin:0 0 8px">チェックしたフォルダに入ります(複数OK)。タップですぐ反映されます。</p><div class="fsel" id="fol">${folders.map(f => `<label class="fchk"><input type="checkbox" value="${f.id}" ${(c.folders || []).includes(f.id) ? 'checked' : ''}><span class="nm">${esc(f.name)}</span><span class="st"></span></label>`).join('')}</div>` : '<div class="sub">フォルダはまだありません(一覧の「＋ 編集」で作れます)</div>'}</div>
+    <div class="panel"><h3>この名刺を入れるフォルダ</h3><p class="sub" style="margin:0 0 8px">タップですぐ反映されます(複数選べます)。</p>${pickerHTML(folders, c.folders || [])}</div>
     <div class="panel"><h3>面談記録</h3>
       ${ms.length ? ms.map(m => `<div class="mt"><div><b>${esc(m.date)}</b> ${esc(m.place)}<button class="link" data-md="${m.id}" style="float:right">削除</button></div><div class="sub" style="white-space:pre-wrap">${esc(m.note)}</div></div>`).join('') : '<div class="sub">まだ記録がありません</div>'}
       <button class="big alt" id="madd" style="margin-top:10px">＋ 面談を追加</button>
@@ -461,11 +492,7 @@ async function viewDetail(id) {
     <button class="big danger" id="del">この名刺を削除</button>`;
   if (img) { let u = img.url; if (!u) { u = URL.createObjectURL(blobOf(img)); urls.push(u); } $('#im').src = u; }
   $('#edit').onclick = () => go('form', id, {});
-  const fol = $('#fol');
-  if (fol) fol.onchange = async () => {
-    c.folders = [...fol.querySelectorAll('input:checked')].map(i => i.value);
-    c.updatedAt = Date.now(); await DB.put('cards', c); toast('フォルダを更新しました');
-  };
+  wirePicker(async sel => { c.folders = sel; c.updatedAt = Date.now(); await DB.put('cards', c); toast('フォルダを更新しました'); });
   $('#madd').onclick = () => { $('#mform').hidden = !$('#mform').hidden; };
   $('#mform').onsubmit = async e => {
     e.preventDefault(); const fd = new FormData(e.target);

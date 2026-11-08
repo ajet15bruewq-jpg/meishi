@@ -78,3 +78,6 @@ input[type=checkbox]{-webkit-appearance:checkbox;appearance:auto;width:24px;heig
 .fchk .st::after{content:"入れない"}
 .fchk:has(input:checked) .st{color:var(--accent);font-weight:600}
 .fchk:has(input:checked) .st::after{content:"✓ 入っている"}
+.fchk .st::after{content:"未選択"}
+.fchk:has(input:checked) .st::after{content:"✓ 選択中"}
+#newfold{margin-top:6px}
