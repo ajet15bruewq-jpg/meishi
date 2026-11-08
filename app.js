@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = '5';
+const APP_VERSION = '7';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -227,14 +227,29 @@ function modal(title, msg, buttons) {
   return new Promise(res => { el.onclick = e => { const b = e.target.closest('button'); if (b) { el.remove(); res(+b.dataset.i); } }; });
 }
 
-// ファイルを保存(共有シート → ファイルAppに保存できる。無理なら通常のダウンロード)
-async function saveFile(name, blob) {
-  const file = new File([blob], name, { type: blob.type });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file] }); return true; } catch (e) { if (e.name === 'AbortError') return false; }
-  }
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000); return true;
+// ファイルを保存。iPhoneの共有シートは「ボタンを直接押した操作」からでないと開けないため、
+// 確認画面のボタンから開く(「"ファイル"に保存」を選べる)。使えない環境では通常のダウンロード。
+function saveFiles(list) {
+  return new Promise(res => {
+    // JSONはiPhoneの共有シートで受け付けられないため、文字ファイルとして渡す(拡張子は.jsonのまま)
+    const files = list.map(([n, b]) => new File([b], n, { type: b.type === 'application/json' ? 'text/plain' : b.type }));
+    const can = !!(navigator.canShare && navigator.canShare({ files }));
+    const el = document.createElement('div'); el.className = 'modal';
+    el.innerHTML = `<div class="box"><h3>ファイルを保存</h3><p>${esc(list.map(x => x[0]).join('\n'))}\n\n${can ? '下のボタンを押し、表示される画面で「"ファイル"に保存」を選んでください。' : '下のボタンでダウンロードします。'}</p>
+      <button class="big" id="sv">${can ? '保存画面を開く' : 'ダウンロード'}</button><button class="big alt" id="sc">キャンセル</button></div>`;
+    document.body.append(el);
+    const download = () => list.forEach(([n, b], i) => setTimeout(() => {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = n; document.body.append(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
+    }, i * 400));
+    el.querySelector('#sc').onclick = () => { el.remove(); res(false); };
+    el.querySelector('#sv').onclick = async () => {
+      if (can) {
+        try { await navigator.share({ files }); el.remove(); res(true); }
+        catch (e) { if (e.name === 'AbortError') return; el.remove(); download(); res(true); }
+      } else { el.remove(); download(); res(true); }
+    };
+  });
 }
 
 /* ----- 一覧 ----- */
@@ -256,7 +271,7 @@ async function viewList() {
     <div class="seg" id="modeSeg"><button data-v="image">画像付き</button><button data-v="text">文字だけ</button></div>
     <div class="count" id="cnt"></div><div id="listBox"></div>
     <button class="fab" id="add">＋ 撮影</button>`;
-  const cards = await DB.all('cards');
+  const cards = await DB.all('cards'), fname = new Map(folders.map(f => [f.id, f.name]));
   const thumbs = new Map((await DB.all('thumbs')).map(t => { let u = t.url; if (!u && (t.blob || t.buf)) { u = URL.createObjectURL(blobOf(t)); } return [t.id, u]; }));
   const draw = () => {
     document.querySelectorAll('#chips button').forEach(b => b.classList.toggle('on', b.dataset.f === ui.folder));
@@ -276,7 +291,7 @@ async function viewList() {
         const b = thumbs.get(c.id);
         if (b) img = `<img src="${b}" alt="">`; else img = '<div class="noimg">画像なし</div>';
       }
-      return `<div class="row" data-id="${c.id}">${img}<div class="t"><div class="n">${esc(displayName(c))}</div><div class="s">${esc([c.company, c.title].filter(Boolean).join(' / '))}</div></div></div>`;
+      return `<div class="row" data-id="${c.id}">${img}<div class="t"><div class="n">${esc(displayName(c))}</div><div class="s">${esc([c.company, c.title].filter(Boolean).join(' / '))}</div>${(c.folders || []).length ? `<div class="s">📁 ${esc((c.folders || []).map(i => fname.get(i)).filter(Boolean).join('・'))}</div>` : ''}</div></div>`;
     }).join('')}</div>` : `<div class="empty">${cards.length ? '該当する名刺がありません' : '名刺がまだありません<br>右下の「＋ 撮影」から追加しましょう'}</div>`;
   };
   draw();
@@ -331,7 +346,7 @@ async function viewScan() {
         else pt.textContent = '準備中…';
       });
       const keep = $('#saveImg').checked;
-      stack.pop(); go('form', null, { prefill: parseCard(ocr.text, ocr.lines), img: keep ? imgBlob : null, thumb: keep ? thBlob : null, raw: ocr.text });
+      stack.pop(); go('form', null, { prefill: parseCard(ocr.text, ocr.lines), img: imgBlob, thumb: thBlob, keep, raw: ocr.text });
     } catch (err) {
       console.error(err);
       pt.textContent = '読み取りに失敗しました: ' + (err && err.message || err) + '(手入力でも登録できます)';
@@ -350,7 +365,7 @@ async function viewForm(id, opt = {}) {
   const selFolders = card ? (card.folders || []) : (ui.folder ? [ui.folder] : []);
   app.innerHTML = `
     <form id="frm">
-      ${opt.img ? `<div class="panel"><img class="preview" id="pv" alt=""></div>` : ''}
+      ${opt.img ? `<div class="panel"><img class="preview" id="pv" alt=""><label class="sw" style="margin-top:10px"><span>この名刺の画像を保存する</span><input type="checkbox" id="keepImg" ${opt.keep !== false ? 'checked' : ''}></label></div>` : ''}
       ${card ? '' : `<details class="panel" ${opt.raw ? '' : 'open'}><summary class="sub">読み取った文字(直して再解析できます)</summary>
         <p class="sub">iPhoneの文字認識が使えます。下の欄をタップ → 「テキストをスキャン」で名刺を写して「挿入」。または上の画像を長押しして文字をコピーし、貼り付けます。</p>
         <textarea id="rawTxt" placeholder="ここに名刺の文字が入ります">${esc(opt.raw)}</textarea>
@@ -358,7 +373,7 @@ async function viewForm(id, opt = {}) {
       <p class="sub">読み取り結果です。間違いがあれば直してから保存してください。</p>
       <div class="two">${['last', 'first'].map(k => fld(k, v)).join('')}</div>
       ${FIELDS.slice(2).map(f => fld(f[0], v)).join('')}
-      ${folders.length ? `<div class="f"><label>フォルダ(複数選べます)</label><div class="tags">${folders.map(f => `<label class="chk"><input type="checkbox" name="fo" value="${f.id}" ${selFolders.includes(f.id) ? 'checked' : ''}> ${esc(f.name)}</label>`).join('')}</div></div>` : ''}
+      ${folders.length ? `<div class="f"><label>この名刺を入れるフォルダ(チェックしたフォルダに入ります。複数OK)</label><div class="fsel">${folders.map(f => `<label class="fchk"><input type="checkbox" name="fo" value="${f.id}" ${selFolders.includes(f.id) ? 'checked' : ''}><span class="nm">${esc(f.name)}</span><span class="st"></span></label>`).join('')}</div></div>` : ''}
       <button class="big" type="submit">保存</button>
     </form>
     <datalist id="countries">${['日本', 'アメリカ', 'イギリス', '中国', '韓国', '台湾', 'シンガポール', 'インド', 'ドイツ', 'フランス', 'オーストラリア', 'カナダ'].map(c => `<option value="${c}">`).join('')}</datalist>`;
@@ -384,6 +399,7 @@ async function viewForm(id, opt = {}) {
     const now = Date.now();
     let saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, folders: fo, updatedAt: now };
     let img = opt.img, thumb = opt.thumb;
+    if ($('#keepImg') && !$('#keepImg').checked) { img = null; thumb = null; }
     try {
       if (!card) {
         // 重複チェック(名前またはメールが同じ)
@@ -432,7 +448,7 @@ async function viewDetail(id) {
     ${show1('会社電話', tel(c.tel))}${show1('携帯電話', tel(c.mobile))}${show1('FAX', esc(c.fax))}
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
     </dl></div>
-    <div class="panel"><h3>フォルダ</h3>${folders.length ? `<div class="tags" id="fol">${folders.map(f => `<button type="button" class="chip ${(c.folders || []).includes(f.id) ? 'on' : ''}" data-f="${f.id}">${esc(f.name)}</button>`).join('')}</div>` : '<div class="sub">フォルダはまだありません(一覧の「＋ 編集」で作れます)</div>'}</div>
+    <div class="panel"><h3>この名刺を入れるフォルダ</h3>${folders.length ? `<p class="sub" style="margin:0 0 8px">チェックしたフォルダに入ります(複数OK)。タップですぐ反映されます。</p><div class="fsel" id="fol">${folders.map(f => `<label class="fchk"><input type="checkbox" value="${f.id}" ${(c.folders || []).includes(f.id) ? 'checked' : ''}><span class="nm">${esc(f.name)}</span><span class="st"></span></label>`).join('')}</div>` : '<div class="sub">フォルダはまだありません(一覧の「＋ 編集」で作れます)</div>'}</div>
     <div class="panel"><h3>面談記録</h3>
       ${ms.length ? ms.map(m => `<div class="mt"><div><b>${esc(m.date)}</b> ${esc(m.place)}<button class="link" data-md="${m.id}" style="float:right">削除</button></div><div class="sub" style="white-space:pre-wrap">${esc(m.note)}</div></div>`).join('') : '<div class="sub">まだ記録がありません</div>'}
       <button class="big alt" id="madd" style="margin-top:10px">＋ 面談を追加</button>
@@ -446,10 +462,9 @@ async function viewDetail(id) {
   if (img) { let u = img.url; if (!u) { u = URL.createObjectURL(blobOf(img)); urls.push(u); } $('#im').src = u; }
   $('#edit').onclick = () => go('form', id, {});
   const fol = $('#fol');
-  if (fol) fol.onclick = async e => {
-    const f = e.target.dataset.f; if (!f) return;
-    const s = new Set(c.folders || []); s.has(f) ? s.delete(f) : s.add(f);
-    c.folders = [...s]; await DB.put('cards', c); viewDetail(id);
+  if (fol) fol.onchange = async () => {
+    c.folders = [...fol.querySelectorAll('input:checked')].map(i => i.value);
+    c.updatedAt = Date.now(); await DB.put('cards', c); toast('フォルダを更新しました');
   };
   $('#madd').onclick = () => { $('#mform').hidden = !$('#mform').hidden; };
   $('#mform').onsubmit = async e => {
@@ -522,7 +537,7 @@ async function viewSettings() {
     const [cards, fol, imgs, ths] = await Promise.all(['cards', 'folders', 'images', 'thumbs'].map(n => DB.all(n)));
     const fix = async r => ({ id: r.id, url: r.url || await toDataUrl(blobOf(r)) });
     const data = { app: 'meishi', version: 1, exportedAt: new Date().toISOString(), cards, folders: fol, images: await Promise.all(imgs.map(fix)), thumbs: await Promise.all(ths.map(fix)) };
-    if (await saveFile(`名刺バックアップ_${today()}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' }))) {
+    if (await saveFiles([[`名刺バックアップ_${today()}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' })]])) {
       await DB.setSetting('lastBackup', Date.now()); toast('バックアップを書き出しました'); viewSettings();
     }
   };
@@ -547,7 +562,7 @@ async function viewSettings() {
     const safe = s => s.replace(/[\\/:*?"<>|]/g, '_');
     const targets = sel === '__each' ? folders.map(f => [f.name, cards.filter(c => (c.folders || []).includes(f.id))]) : [[sel ? fmap.get(sel) : 'すべて', sel ? cards.filter(c => (c.folders || []).includes(sel)) : cards]];
     if (!targets.length) { toast('フォルダがありません'); return; }
-    for (const [name, list] of targets) await saveFile(`名刺_${safe(name)}_${today()}.csv`, new Blob([make(list)], { type: 'text/csv' }));
+    await saveFiles(targets.map(([name, list]) => [`名刺_${safe(name)}_${today()}.csv`, new Blob([make(list)], { type: 'text/csv' })]));
   };
 }
 
