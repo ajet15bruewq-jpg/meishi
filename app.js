@@ -205,7 +205,7 @@ async function viewList() {
     <div class="count" id="cnt"></div><div id="listBox"></div>
     <button class="fab" id="add">＋ 撮影</button>`;
   const cards = await DB.all('cards');
-  const thumbs = new Map((await DB.all('thumbs')).map(t => [t.id, t.url]));
+  const thumbs = new Map((await DB.all('thumbs')).map(t => { let u = t.url; if (!u && (t.blob || t.buf)) { u = URL.createObjectURL(blobOf(t)); } return [t.id, u]; }));
   const draw = () => {
     revokeUrls();
     document.querySelectorAll('#sortSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === ui.sort));
@@ -287,7 +287,10 @@ async function viewForm(id, opt = {}) {
   app.innerHTML = `
     <form id="frm">
       ${opt.img ? `<div class="panel"><img class="preview" id="pv" alt=""></div>` : ''}
-      ${opt.raw ? `<details class="panel"><summary class="sub">読み取った文字(参考)</summary><pre>${esc(opt.raw)}</pre></details>` : ''}
+      ${card ? '' : `<details class="panel" ${opt.raw ? '' : 'open'}><summary class="sub">読み取った文字(直して再解析できます)</summary>
+        <p class="sub">iPhoneの文字認識が使えます。下の欄をタップ → 「テキストをスキャン」で名刺を写して「挿入」。または上の画像を長押しして文字をコピーし、貼り付けます。</p>
+        <textarea id="rawTxt" placeholder="ここに名刺の文字が入ります">${esc(opt.raw)}</textarea>
+        <button class="big alt" type="button" id="reparse" style="margin:8px 0 0">この文字で項目に振り分け直す</button></details>`}
       <p class="sub">読み取り結果です。間違いがあれば直してから保存してください。</p>
       <div class="two">${['last', 'first'].map(k => fld(k, v)).join('')}</div>
       ${FIELDS.slice(2).map(f => fld(f[0], v)).join('')}
@@ -301,6 +304,11 @@ async function viewForm(id, opt = {}) {
     return `<div class="f"><label for="f_${k}">${label}</label>${input}</div>`;
   }
   if (opt.img) $('#pv').src = opt.img;
+  if ($('#reparse')) $('#reparse').onclick = () => {
+    const p = parseCard($('#rawTxt').value);
+    for (const k in p) { const el = $('#f_' + k); if (el) el.value = p[k]; }
+    toast('振り分け直しました');
+  };
   $('#frm').onsubmit = async e => {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(e.target).entries());
@@ -334,7 +342,7 @@ async function viewDetail(id) {
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
     ${img ? `<dt>名刺画像</dt><dd><img id="im" alt=""></dd>` : ''}</dl></div>
     <button class="big danger" id="del">この名刺を削除</button>`;
-  if (img) $('#im').src = img.url;
+  if (img) { let u = img.url; if (!u) { u = URL.createObjectURL(blobOf(img)); urls.push(u); } $('#im').src = u; }
   $('#edit').onclick = () => go('form', id, {});
   $('#del').onclick = async () => {
     if (!confirm(`「${displayName(c)}」を削除します。元に戻せません。よろしいですか?`)) return;
