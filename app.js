@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -117,6 +117,11 @@ async function getWorker() {
   return worker;
 }
 async function runOCR(canvas, cb) {
+  // 高精度エンジン(試験版)を選んでいる場合はそちらを先に試し、失敗したら標準に自動で戻す
+  if (await DB.setting('ocrEngine', 'tesseract') === 'paddle' && (typeof Paddle !== 'undefined')) {
+    try { const r = await Paddle.run(canvas, cb); r.engine = 'paddle'; return r; }
+    catch (err) { console.error('高精度エンジン失敗', err); cb({ status: 'init', label: '高精度エンジンが使えないため、標準の読み取りに切り替えます…' }); }
+  }
   progressCb = cb;
   const w = await getWorker();
   await w.setParameters({ tessedit_pageseg_mode: '11' }); // 名刺は文字が点在するため疎なテキスト向けモード
@@ -131,7 +136,8 @@ function parseCard(raw, hl) {
   const TITLE_RE = /(部長|課長|取締役|社長|代表|主任|マネージャ|リーダー|室長|係長|所長|店長|教授|CEO|CTO|COO|CFO|President|Director|Manager|Engineer|Officer|Head|Lead|Chief|Representative|Professor)/i;
   const DEPT_RE = /(部|課|室|本部|センター|Department|Dept|Division|Team|チーム)$/i;
   const orig = [], hs = [];
-  const src = hl && hl.length ? hl.map(x => ({ l: (x.text || '').trim(), h: x.bbox ? x.bbox.y1 - x.bbox.y0 : 0 })) : raw.split(/\r?\n/).map(l => ({ l: l.trim(), h: 0 }));
+  const src = (hl && hl.length ? hl.map(x => ({ l: (x.text || '').trim(), h: x.bbox ? x.bbox.y1 - x.bbox.y0 : 0 })) : raw.split(/\r?\n/).map(l => ({ l: l.trim(), h: 0 })))
+    .map(x => ({ ...x, l: x.l.replace(/^[テ〒](?=\s?\d{3}-?\d{4})/, '〒') }));   // 〒がテと読まれることがある
   src.filter(x => x.l.length > 1).forEach(({ l, h }) => {
     const push = (...a) => a.forEach(s => { orig.push(s); hs.push(h); });
     const toks = squeeze(l).split(/\s+/);
@@ -364,7 +370,8 @@ async function viewScan() {
       $('#pv').src = imgBlob;
       pt.textContent = '読み取りエンジンを準備中…(初回は少し時間がかかります)';
       const ocr = await runOCR(ocrC, m => {
-        if (m.status === 'recognizing text') { pb.style.width = Math.round(m.progress * 100) + '%'; pt.textContent = `文字を読み取り中… ${Math.round(m.progress * 100)}%`; }
+        if (m.label) { pt.textContent = m.label; if (m.progress != null) pb.style.width = Math.round(m.progress * 100) + '%'; }
+        else if (m.status === 'recognizing text') { pb.style.width = Math.round(m.progress * 100) + '%'; pt.textContent = `文字を読み取り中… ${Math.round(m.progress * 100)}%`; }
         else pt.textContent = '準備中…';
       });
       const keep = $('#saveImg').checked;
@@ -547,6 +554,11 @@ async function viewSettings() {
   app.innerHTML = `
     <div class="panel"><label class="sw"><span>名刺の画像を保存する</span><input type="checkbox" id="saveImg" ${saveImg ? 'checked' : ''}></label>
       <p class="sub">オフにすると、これから登録する名刺には画像を保存しません。すでにある画像は、各名刺の詳細から個別に削除できます。</p></div>
+    <div class="panel"><h3>読み取りエンジン</h3>
+      <div class="seg" id="engSeg"><button data-v="tesseract">標準</button><button data-v="paddle">高精度(試験版)</button></div>
+      <p class="sub" id="engNote"></p>
+      <button class="big alt" id="engDl" style="margin:0" hidden>高精度エンジンを準備する(約32MB・Wi-Fi推奨)</button>
+      <div class="bar" id="engBar" hidden><i id="engPb"></i></div></div>
     <div class="panel"><h3>フォルダ</h3><button class="big alt" id="gofol" style="margin:0">フォルダを作成・名前変更・削除</button></div>
     <div class="panel"><h3>バックアップ(完全)</h3>
       <p class="sub">前回: ${last ? new Date(last).toLocaleDateString('ja-JP') : 'まだありません'}<br>名刺・フォルダ・面談記録・画像をすべて含むJSONファイルです。書き出したら「ファイルに保存」を選んでください。</p>
@@ -560,6 +572,23 @@ async function viewSettings() {
     <p class="sub" style="text-align:center">版 ${APP_VERSION} / データはこの端末内にのみ保存されます</p>`;
   $('#saveImg').onchange = e => DB.setSetting('saveImage', e.target.checked);
   $('#gofol').onclick = () => go('folders');
+  // 読み取りエンジンの切り替え(いつでも標準に戻せる)
+  let eng = await DB.setting('ocrEngine', 'tesseract'), ready = (typeof Paddle !== 'undefined') ? await Paddle.isReady() : false;
+  const drawEng = () => {
+    document.querySelectorAll('#engSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === eng));
+    $('#engDl').hidden = !(eng === 'paddle' && !ready);
+    $('#engNote').textContent = eng === 'paddle'
+      ? (ready ? '高精度エンジンを使います。読み取りに数秒〜十数秒かかります。うまくいかない場合は自動で標準に切り替わります。' : '先に下のボタンで、読み取りデータを端末に保存してください(1回だけ)。保存するまでは標準で読み取ります。')
+      : '標準(Tesseract)で読み取ります。';
+  };
+  drawEng();
+  $('#engSeg').onclick = async e => { const v = e.target.dataset.v; if (!v) return; eng = v; await DB.setSetting('ocrEngine', v); drawEng(); };
+  $('#engDl').onclick = async () => {
+    const b = $('#engDl'); b.disabled = true; $('#engBar').hidden = false;
+    try { await Paddle.download(p => { $('#engPb').style.width = Math.round(p * 100) + '%'; }); ready = await Paddle.isReady(); toast('準備ができました'); }
+    catch (err) { alert('ダウンロードに失敗しました。Wi-Fiを確認してもう一度お試しください: ' + (err && err.message || err)); }
+    b.disabled = false; $('#engBar').hidden = true; drawEng();
+  };
   $('#bk').onclick = async () => {
     const [cards, fol, imgs, ths] = await Promise.all(['cards', 'folders', 'images', 'thumbs'].map(n => DB.all(n)));
     const fix = async r => ({ id: r.id, url: r.url || await toDataUrl(blobOf(r)) });
