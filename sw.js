@@ -1,4 +1,4 @@
-﻿const VER = 'meishi-v8';
+﻿const VER = 'meishi-v10';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'paddle.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png', 'lib/tesseract.min.js', 'lib/worker.min.js'];
 // OCR用の大きいファイル。取得に失敗してもインストールは止めない
 const OCR = ['lib/lang/jpn.traineddata.gz', 'lib/lang/eng.traineddata.gz', 'lib/tesseract-core-simd-lstm.wasm.js', 'lib/tesseract-core-lstm.wasm.js'];
@@ -40,6 +40,8 @@ self.addEventListener('fetch', e => {
     }
   })());
 });
+
+
 
 
 

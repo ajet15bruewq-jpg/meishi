@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = '9';
+const APP_VERSION = '10';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -102,6 +102,67 @@ function enhance(c) {
   const k = 255 / Math.max(1, hi - lo);
   for (let i = 0; i < p.length; i += 4) { const v = Math.max(0, Math.min(255, (p[i] - lo) * k)); p[i] = p[i + 1] = p[i + 2] = v; }
   g.putImageData(d, 0, 0); return c;
+}
+/* ----- 名刺の自動切り抜き -----
+   周囲(机など)の色を基準に、名刺の部分を探して傾きも補正して切り出す。見つからなければ null(元の写真を使う) */
+function detectCard(bmp) {
+  const w0 = bmp.width || bmp.naturalWidth, h0 = bmp.height || bmp.naturalHeight, s = Math.min(1, 480 / Math.max(w0, h0));
+  const w = Math.round(w0 * s), h = Math.round(h0 * s), n = w * h;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(bmp, 0, 0, w, h);
+  const px = g.getImageData(0, 0, w, h).data;
+  // 背景色 = 画像の外周の色の中央値
+  const m = Math.max(2, Math.round(Math.min(w, h) * 0.03)), rs = [], gs = [], bs = [];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (x < m || y < m || x >= w - m || y >= h - m) { const i = (y * w + x) * 4; rs.push(px[i]); gs.push(px[i + 1]); bs.push(px[i + 2]); }
+  const med = a => a.sort((p, q) => p - q)[a.length >> 1], br = med(rs), bg = med(gs), bb = med(bs);
+  const dist = new Uint8Array(n), hist = new Uint32Array(256);
+  for (let i = 0; i < n; i++) { const d = Math.min(255, Math.hypot(px[i * 4] - br, px[i * 4 + 1] - bg, px[i * 4 + 2] - bb) | 0); dist[i] = d; hist[d]++; }
+  // 大津の方法で「背景に近い/遠い」を分ける
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let wB = 0, sB = 0, best = 0, th = 30;
+  for (let t = 0; t < 256; t++) { wB += hist[t]; if (!wB) continue; const wF = n - wB; if (!wF) break; sB += t * hist[t]; const mB = sB / wB, mF = (sum - sB) / wF, v = wB * wF * (mB - mF) * (mB - mF); if (v > best) { best = v; th = t; } }
+  th = Math.max(th, 25);
+  // いちばん大きい塊を名刺とみなす
+  const lab = new Uint8Array(n), stack = new Int32Array(n); let bestPts = null, bestCnt = 0;
+  for (let i = 0; i < n; i++) {
+    if (lab[i] || dist[i] <= th) continue;
+    const pts = []; let sp = 0, cnt = 0; stack[sp++] = i; lab[i] = 1;
+    while (sp) {
+      const p = stack[--sp], x = p % w, y = (p / w) | 0; cnt++;
+      let edge = false;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= w || Y >= h) { edge = true; continue; }
+        const q = Y * w + X; if (dist[q] > th) { if (!lab[q]) { lab[q] = 1; stack[sp++] = q; } } else edge = true;
+      }
+      if (edge) pts.push([x, y]);
+    }
+    if (cnt > bestCnt) { bestCnt = cnt; bestPts = pts; }
+  }
+  if (!bestPts || bestCnt < n * 0.1 || bestCnt > n * 0.97) return null;
+  // 凸包 → 面積が最小になる向きの長方形
+  const P = bestPts.sort((a, b) => a[0] - b[0] || a[1] - b[1]), cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const p of P) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (const p of [...P].reverse()) { while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  const hull = [...lo.slice(0, -1), ...up.slice(0, -1)];
+  let r = null;
+  for (let deg = -44; deg <= 45; deg++) {   // 写真の向きに近い角度を優先(名刺が横向きなら横向きのまま)
+    const a = deg * Math.PI / 180, co = Math.cos(a), si = Math.sin(a);
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (const [x, y] of hull) { const u = x * co + y * si, v = -x * si + y * co; if (u < x0) x0 = u; if (u > x1) x1 = u; if (v < y0) y0 = v; if (v > y1) y1 = v; }
+    const area = (x1 - x0) * (y1 - y0); if (!r || area < r.area) r = { area, a, x0, y0, W: x1 - x0, H: y1 - y0 };
+  }
+  const ratio = r.W / r.H, fill = bestCnt / r.area;
+  const okShape = (ratio > 1.25 && ratio < 2.2) || (ratio > 0.45 && ratio < 0.8);
+  if (!okShape || fill < 0.82 || r.area > n * 0.97) return null;   // 名刺らしくない形は使わない
+  const mg = Math.min(r.W, r.H) * 0.015;                           // 少しだけ余白
+  return { s, a: r.a, x0: r.x0 - mg, y0: r.y0 - mg, W: r.W + 2 * mg, H: r.H + 2 * mg };
+}
+function cropCanvas(bmp, r, maxSide) {
+  const q = Math.min(1 / r.s, maxSide / Math.max(r.W, r.H)), A = q * r.s, co = Math.cos(r.a), si = Math.sin(r.a);
+  const c = document.createElement('canvas'); c.width = Math.round(q * r.W); c.height = Math.round(q * r.H);
+  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.setTransform(A * co, -A * si, A * si, A * co, -q * r.x0, -q * r.y0); g.drawImage(bmp, 0, 0); return c;
 }
 const toBlob = (c, q) => new Promise(r => c.toBlob(r, 'image/jpeg', q));
 
@@ -342,7 +403,7 @@ async function viewList() {
 /* ----- 撮影・読み取り ----- */
 async function viewScan() {
   titleEl.textContent = '名刺を読み取る';
-  const saveImg = await DB.setting('saveImage', true);
+  const saveImg = await DB.setting('saveImage', true), autoCrop = await DB.setting('autoCrop', true);
   app.innerHTML = `
     <div class="panel">
       <button class="big" id="cam">📷 カメラで撮影</button>
@@ -351,6 +412,7 @@ async function viewScan() {
       <input type="file" id="fCam" accept="image/*" capture="environment" hidden>
       <input type="file" id="fAlb" accept="image/*" hidden>
       <label class="sw"><span>名刺の画像を保存する</span><input type="checkbox" id="saveImg" ${saveImg ? 'checked' : ''}></label>
+      <label class="sw" style="margin-top:10px"><span>名刺の部分だけに自動で切り抜く</span><input type="checkbox" id="autoCrop" ${autoCrop ? 'checked' : ''}></label>
       <p class="sub">名刺を平らな場所に置き、明るい場所でまっすぐ撮影すると精度が上がります。読み取りはすべて端末内で行われ、外部には送信されません。</p>
     </div>
     <div id="prog" class="panel" hidden><img class="preview" id="pv" alt=""><div class="bar"><i id="pb"></i></div><div class="sub" id="pt">準備中…</div></div>`;
@@ -358,6 +420,7 @@ async function viewScan() {
   $('#alb').onclick = () => $('#fAlb').click();
   $('#manual').onclick = () => { stack.pop(); go('form', null, { prefill: {}, img: null, thumb: null, raw: '' }); };
   $('#saveImg').onchange = e => DB.setSetting('saveImage', e.target.checked);
+  $('#autoCrop').onchange = e => DB.setSetting('autoCrop', e.target.checked);
   const handle = async e => {
     const f = e.target.files[0]; if (!f) return;
     $('#prog').hidden = false; ['cam', 'alb', 'manual'].forEach(i => $('#' + i).disabled = true);
@@ -365,8 +428,12 @@ async function viewScan() {
     try {
       pt.textContent = '画像を処理中…';
       const bmp = await loadImage(f);
-      const full = toCanvas(bmp, 1600), ocrC = toCanvas(bmp, 2000), th = toCanvas(bmp, 320);
+      const rect = $('#autoCrop').checked ? detectCard(bmp) : null;   // 名刺の部分だけを探す
+      const mk = max => rect ? cropCanvas(bmp, rect, max) : toCanvas(bmp, max);
+      const full = mk(1600), ocrC = mk(2000), th = toCanvas(full, 320);
       const imgBlob = full.toDataURL('image/jpeg', .8), thBlob = th.toDataURL('image/jpeg', .7);
+      let orig = null;
+      if (rect) { const o = toCanvas(bmp, 1600); orig = { img: o.toDataURL('image/jpeg', .8), thumb: toCanvas(o, 320).toDataURL('image/jpeg', .7) }; }
       $('#pv').src = imgBlob;
       pt.textContent = '読み取りエンジンを準備中…(初回は少し時間がかかります)';
       const ocr = await runOCR(ocrC, m => {
@@ -375,7 +442,7 @@ async function viewScan() {
         else pt.textContent = '準備中…';
       });
       const keep = $('#saveImg').checked;
-      stack.pop(); go('form', null, { prefill: parseCard(ocr.text, ocr.lines), img: imgBlob, thumb: thBlob, keep, raw: ocr.text });
+      stack.pop(); go('form', null, { prefill: parseCard(ocr.text, ocr.lines), img: imgBlob, thumb: thBlob, orig, keep, raw: ocr.text });
     } catch (err) {
       console.error(err);
       pt.textContent = '読み取りに失敗しました: ' + (err && err.message || err) + '(手入力でも登録できます)';
@@ -394,7 +461,8 @@ async function viewForm(id, opt = {}) {
   const selFolders = card ? (card.folders || []) : (ui.folder ? [ui.folder] : []);
   app.innerHTML = `
     <form id="frm">
-      ${opt.img ? `<div class="panel"><img class="preview" id="pv" alt=""><label class="sw" style="margin-top:10px"><span>この名刺の画像を保存する</span><input type="checkbox" id="keepImg" ${opt.keep !== false ? 'checked' : ''}></label></div>` : ''}
+      ${opt.img ? `<div class="panel"><img class="preview" id="pv" alt=""><label class="sw" style="margin-top:10px"><span>この名刺の画像を保存する</span><input type="checkbox" id="keepImg" ${opt.keep !== false ? 'checked' : ''}></label>
+        ${opt.orig ? `<label class="sw" style="margin-top:10px"><span>名刺の部分だけに切り抜いた画像を使う</span><input type="checkbox" id="useCrop" checked></label>` : '<p class="sub" style="margin:8px 0 0">名刺の枠を自動で見つけられなかったため、撮影した写真をそのまま使います。</p>'}</div>` : ''}
       ${card ? '' : `<details class="panel" ${opt.raw ? '' : 'open'}><summary class="sub">読み取った文字(直して再解析できます)</summary>
         <p class="sub">iPhoneの文字認識が使えます。下の欄をタップ → 「テキストをスキャン」で名刺を写して「挿入」。または上の画像を長押しして文字をコピーし、貼り付けます。</p>
         <textarea id="rawTxt" placeholder="ここに名刺の文字が入ります">${esc(opt.raw)}</textarea>
@@ -419,6 +487,7 @@ async function viewForm(id, opt = {}) {
   }
   wirePicker();
   if (opt.img) $('#pv').src = opt.img;
+  if ($('#useCrop')) $('#useCrop').onchange = e => { $('#pv').src = e.target.checked ? opt.img : opt.orig.img; };
   if ($('#reparse')) $('#reparse').onclick = () => {
     const p = parseCard($('#rawTxt').value);
     for (const k in p) { const el = $('#f_' + k); if (el) el.value = p[k]; }
@@ -436,6 +505,7 @@ async function viewForm(id, opt = {}) {
     const now = Date.now();
     let saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, folders: fo, updatedAt: now };
     let img = opt.img, thumb = opt.thumb;
+    if ($('#useCrop') && !$('#useCrop').checked) { img = opt.orig.img; thumb = opt.orig.thumb; }
     if ($('#keepImg') && !$('#keepImg').checked) { img = null; thumb = null; }
     try {
       if (!card) {
