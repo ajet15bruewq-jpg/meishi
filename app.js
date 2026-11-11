@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = '10';
+const APP_VERSION = '11';
 /* ========== 共通 ========== */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -279,7 +279,24 @@ function show() {
   window.scrollTo(0, 0);
   ({ list: viewList, scan: viewScan, form: viewForm, detail: viewDetail, settings: viewSettings, folders: viewFolders })[view](...args);
 }
-backBtn.onclick = back;
+// 入力中の名刺登録画面から戻るときは確認する
+let formDirty = false;
+function tryBack() {
+  if (stack.length <= 1 || document.querySelector('.modal')) return;
+  const top = stack[stack.length - 1][0];
+  if (top === 'form' && formDirty && !confirm('入力中の内容は保存されません。戻りますか?')) return;
+  back();
+}
+backBtn.onclick = tryBack;
+// iPhoneの「画面の左端から右へスワイプ」で戻る
+{
+  let sx = 0, sy = 0, st = 0, on = false;
+  document.addEventListener('touchstart', e => { const t = e.touches[0]; on = e.touches.length === 1 && t.clientX < 40; sx = t.clientX; sy = t.clientY; st = Date.now(); }, { passive: true });
+  document.addEventListener('touchend', e => {
+    if (!on) return; on = false; const t = e.changedTouches[0], dx = t.clientX - sx, dy = Math.abs(t.clientY - sy);
+    if (dx > 70 && dy < dx * 0.6 && Date.now() - st < 800) tryBack();
+  }, { passive: true });
+}
 const goList = () => { stack.length = 0; stack.push(['list', []]); show(); };
 
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
@@ -469,6 +486,9 @@ async function viewForm(id, opt = {}) {
         <button class="big alt" type="button" id="reparse" style="margin:8px 0 0">この文字で項目に振り分け直す</button></details>`}
       <p class="sub">読み取り結果です。間違いがあれば直してから保存してください。</p>
       <div class="two">${['last', 'first'].map(k => fld(k, v)).join('')}</div>
+      <div class="f"><label>性別(選ばなくても登録できます)</label><div class="tags" id="gsel">
+        <label class="chk"><input type="checkbox" name="gender" value="male" ${v.gender === 'male' ? 'checked' : ''}> 男</label>
+        <label class="chk"><input type="checkbox" name="gender" value="female" ${v.gender === 'female' ? 'checked' : ''}> 女</label></div></div>
       ${FIELDS.slice(2).map(f => fld(f[0], v)).join('')}
       <div class="f"><label>この名刺を入れるフォルダ(複数選べます)</label>${pickerHTML(folders, selFolders)}</div>
       ${card ? '' : `<details class="panel" id="mdet"><summary class="sub">面談記録を最初に書く(任意)</summary>
@@ -486,6 +506,9 @@ async function viewForm(id, opt = {}) {
     return `<div class="f"><label for="f_${k}">${label}</label>${input}</div>`;
   }
   wirePicker();
+  formDirty = false; $('#frm').addEventListener('input', () => { formDirty = true; });
+  // 男・女はどちらか一方だけ(もう一度押すと外れる)
+  $('#gsel').onchange = e => { if (e.target.checked) document.querySelectorAll('#gsel input').forEach(i => { if (i !== e.target) i.checked = false; }); };
   if (opt.img) $('#pv').src = opt.img;
   if ($('#useCrop')) $('#useCrop').onchange = e => { $('#pv').src = e.target.checked ? opt.img : opt.orig.img; };
   if ($('#reparse')) $('#reparse').onclick = () => {
@@ -496,11 +519,12 @@ async function viewForm(id, opt = {}) {
   $('#frm').onsubmit = async e => {
     e.preventDefault();
     const fd = new FormData(e.target), fo = fd.getAll('fo'); fd.delete('fo');
+    const gender = fd.getAll('gender')[0] || ''; fd.delete('gender');
     const mt = { date: fd.get('m_date') || today(), place: (fd.get('m_place') || '').trim(), note: (fd.get('m_note') || '').trim() };
     ['m_date', 'm_place', 'm_note'].forEach(k => fd.delete(k));
     const d = Object.fromEntries(fd.entries());
     for (const k in d) d[k] = d[k].trim();
-    d.yomi = kata2hira(d.yomi);
+    d.yomi = kata2hira(d.yomi); d.gender = gender;
     if (!d.last && !d.first && !d.company) { toast('名前か会社名を入力してください'); return; }
     const now = Date.now();
     let saved = { ...(card || { id: uid(), meetings: [], createdAt: now }), ...d, folders: fo, updatedAt: now };
@@ -520,9 +544,9 @@ async function viewForm(id, opt = {}) {
           if (c === 3) return;
           if (c === 0 || c === 1) {
             const folderUnion = [...new Set([...(dup.folders || []), ...fo])];
-            if (c === 1) saved = { ...dup, ...d, folders: folderUnion, updatedAt: now };
+            if (c === 1) { saved = { ...dup, ...d, folders: folderUnion, updatedAt: now }; if (!d.gender) saved.gender = dup.gender || ''; }
             else {
-              saved = { ...dup, folders: folderUnion, updatedAt: now };
+              saved = { ...dup, folders: folderUnion, updatedAt: now, gender: dup.gender || d.gender || '' };
               FIELDS.forEach(([k]) => { saved[k] = dup[k] || d[k] || ''; });
               if (dup.memo && d.memo && dup.memo !== d.memo) saved.memo = dup.memo + '\n' + d.memo;
               if (await DB.get('images', dup.id)) { img = null; thumb = null; }
@@ -551,7 +575,7 @@ async function viewDetail(id) {
   const tel = s => s ? `<a href="tel:${esc(dig(s))}">${esc(s)}</a>` : '';
   const ms = [...(c.meetings || [])].sort((a, b) => cmp(b.date, a.date));
   app.innerHTML = `<div class="panel d"><dl style="margin:0">
-    ${show1('名前', esc(displayName(c)))}${show1('読み', esc(c.yomi))}${show1('会社名', esc(c.company))}${show1('部署', esc(c.dept))}${show1('役職', esc(c.title))}${show1('国', esc(c.country))}
+    ${show1('名前', esc(displayName(c)))}${show1('性別', c.gender === 'male' ? '男' : c.gender === 'female' ? '女' : '')}${show1('読み', esc(c.yomi))}${show1('会社名', esc(c.company))}${show1('部署', esc(c.dept))}${show1('役職', esc(c.title))}${show1('国', esc(c.country))}
     ${show1('メール', c.email ? `<a href="mailto:${esc(c.email)}">${esc(c.email)}</a>` : '')}
     ${show1('会社電話', tel(c.tel))}${show1('携帯電話', tel(c.mobile))}${show1('FAX', esc(c.fax))}
     ${show1('住所', esc(c.address))}${show1('メモ', esc(c.memo))}
@@ -680,9 +704,9 @@ async function viewSettings() {
   };
   $('#csv').onclick = async () => {
     const cards = await DB.all('cards'), sel = $('#csvSel').value, fmap = new Map(folders.map(f => [f.id, f.name]));
-    const head = ['姓', '名', '読み', '会社名', '部署', '役職', '国', 'メール', '会社電話', '携帯電話', 'FAX', '住所', 'メモ', 'フォルダ', '最終面談日', '面談記録'];
+    const head = ['姓', '名', '性別', '読み','会社名', '部署', '役職', '国', 'メール', '会社電話', '携帯電話', 'FAX', '住所', 'メモ', 'フォルダ', '最終面談日', '面談記録'];
     const make = list => '﻿' + [head, ...list.sort((a, b) => cmp(sortKey(a), sortKey(b))).map(c => [
-      c.last, c.first, c.yomi, c.company, c.dept, c.title, c.country, c.email, c.tel, c.mobile, c.fax, c.address, c.memo,
+      c.last, c.first, c.gender === 'male' ? '男' : c.gender === 'female' ? '女' : '', c.yomi, c.company, c.dept, c.title, c.country, c.email, c.tel, c.mobile, c.fax, c.address, c.memo,
       (c.folders || []).map(i => fmap.get(i)).filter(Boolean).join(' / '), lastMet(c),
       [...(c.meetings || [])].sort((a, b) => cmp(a.date, b.date)).map(m => `${m.date} ${m.place} ${m.note}`.trim()).join('\n')])].map(r => r.map(csvCell).join(',')).join('\r\n');
     const safe = s => s.replace(/[\\/:*?"<>|]/g, '_');
